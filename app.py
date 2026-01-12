@@ -1,9 +1,13 @@
 import os
 import io
 import zipfile
-import sqlite3
+import hmac
 from datetime import date, datetime
 from functools import wraps
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+import psycopg2
+import psycopg2.extras
 
 from flask import (
     Flask,
@@ -15,23 +19,18 @@ from flask import (
     send_file,
     abort,
 )
-from werkzeug.security import generate_password_hash, check_password_hash
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 
 # ---------------- CONFIG ----------------
-DB_FILE = "loan.db"
-
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")  # set in Render
-ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD)
-
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-secret")  # set in Render
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-secret")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 DEFAULT_PRINCIPAL = 2_225_000.00
-DEFAULT_INTEREST_RATE = 0.064  # annual as decimal (6.4%)
-
+DEFAULT_INTEREST_RATE = 0.064  # annual as decimal
 DEFAULT_PEOPLE = ["Person A", "Person B", "Person C", "Person D"]
 
 
@@ -39,96 +38,197 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
 
-# ---------------- DB HELPERS ----------------
-def get_db():
-    db = sqlite3.connect(DB_FILE)
-    db.row_factory = sqlite3.Row
-    return db
+# ---------------- DB (Postgres) ----------------
+def _with_sslmode(url: str) -> str:
+    """Ensure sslmode is set. Supabase typically requires SSL."""
+    if not url:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+    if "sslmode" not in q:
+        q["sslmode"] = "require"
+        u = u._replace(query=urlencode(q))
+    return urlunparse(u)
 
 
-def ensure_column(db, table: str, column: str, coltype: str):
-    cols = [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in cols:
-        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL env var in Render.")
+    return psycopg2.connect(_with_sslmode(DATABASE_URL))
 
 
-def get_setting(db, key: str) -> str:
-    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+def db_exec(sql: str, params=None, fetch="none"):
+    """
+    fetch: 'none' | 'one' | 'all'
+    Returns dict rows when fetching.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params or ())
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return None
+
+
+def get_setting(key: str) -> str:
+    row = db_exec("SELECT value FROM settings WHERE key=%s;", (key,), fetch="one")
     if not row:
         raise RuntimeError(f"Missing setting: {key}")
     return row["value"]
 
 
-def set_setting(db, key: str, value: str):
-    db.execute(
-        "INSERT INTO settings(key,value) VALUES(?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+def set_setting(key: str, value: str):
+    db_exec(
+        """
+        INSERT INTO settings(key, value)
+        VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;
+        """,
         (key, value),
     )
 
 
 def init_db():
-    db = get_db()
-
-    db.execute(
-        """CREATE TABLE IF NOT EXISTS settings (
+    db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        )"""
+        );
+        """
     )
 
-    db.execute(
-        """CREATE TABLE IF NOT EXISTS people (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS people (
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
-            balance REAL NOT NULL,
+            balance NUMERIC NOT NULL,
             last_calc DATE NOT NULL
-        )"""
+        );
+        """
     )
 
-    db.execute(
-        """CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            interest REAL NOT NULL,
+    db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            amount NUMERIC NOT NULL,
+            interest NUMERIC NOT NULL,
             pay_date DATE NOT NULL,
-            notes TEXT,
-            FOREIGN KEY(person_id) REFERENCES people(id)
-        )"""
+            notes TEXT
+        );
+        """
     )
 
-    # Safe upgrades for existing DBs
-    ensure_column(db, "payments", "notes", "TEXT")
-    ensure_column(db, "people", "last_calc", "DATE")
+    # Defaults (only if missing)
+    db_exec(
+        """
+        INSERT INTO settings(key, value)
+        VALUES ('principal', %s)
+        ON CONFLICT (key) DO NOTHING;
+        """,
+        (str(DEFAULT_PRINCIPAL),),
+    )
 
-    # Default settings
-    if not db.execute("SELECT 1 FROM settings WHERE key='principal'").fetchone():
-        set_setting(db, "principal", str(DEFAULT_PRINCIPAL))
+    db_exec(
+        """
+        INSERT INTO settings(key, value)
+        VALUES ('interest_rate', %s)
+        ON CONFLICT (key) DO NOTHING;
+        """,
+        (str(DEFAULT_INTEREST_RATE),),
+    )
 
-    if not db.execute("SELECT 1 FROM settings WHERE key='interest_rate'").fetchone():
-        set_setting(db, "interest_rate", str(DEFAULT_INTEREST_RATE))
-
-    if not db.execute("SELECT 1 FROM settings WHERE key='start_date'").fetchone():
-        # Anchor used for recompute after edits/deletes.
-        set_setting(db, "start_date", date.today().isoformat())
+    db_exec(
+        """
+        INSERT INTO settings(key, value)
+        VALUES ('start_date', %s)
+        ON CONFLICT (key) DO NOTHING;
+        """,
+        (date.today().isoformat(),),
+    )
 
     # Seed people if empty
-    c = db.execute("SELECT COUNT(*) AS c FROM people").fetchone()["c"]
-    if c == 0:
-        principal = float(get_setting(db, "principal"))
+    cnt = db_exec("SELECT COUNT(*) AS c FROM people;", fetch="one")["c"]
+    if int(cnt) == 0:
+        principal = float(get_setting("principal"))
         share = principal / 4.0
-        start = get_setting(db, "start_date")
-        for name in DEFAULT_PEOPLE:
-            db.execute(
-                "INSERT INTO people(name,balance,last_calc) VALUES(?,?,?)",
-                (name, share, start),
-            )
-
-    db.commit()
-    db.close()
+        start = get_setting("start_date")
+        for nm in DEFAULT_PEOPLE:
+            db_exec("INSERT INTO people(name, balance, last_calc) VALUES (%s, %s, %s);", (nm, share, start))
 
 
+def daily_rate() -> float:
+    return float(get_setting("interest_rate")) / 365.0
+
+
+def accrue_interest_between(balance: float, d_rate: float, from_date: date, to_date: date) -> float:
+    days = (to_date - from_date).days
+    if days <= 0:
+        return 0.0
+    return balance * d_rate * days
+
+
+def earliest_payment_date():
+    row = db_exec("SELECT MIN(pay_date) AS d FROM payments;", fetch="one")
+    return row["d"]  # may be None
+
+
+def recompute_all():
+    """
+    Recompute balances + per-payment interest from start_date to today.
+    Ensures edits/deletes stay mathematically correct.
+    """
+    principal = float(get_setting("principal"))
+    start = datetime.strptime(get_setting("start_date"), "%Y-%m-%d").date()
+    d_rate = daily_rate()
+
+    people = db_exec("SELECT id FROM people ORDER BY id;", fetch="all")
+    if not people:
+        return
+
+    share = principal / float(len(people))
+
+    # Reset each person to equal share at the loan start date
+    for p in people:
+        db_exec("UPDATE people SET balance=%s, last_calc=%s WHERE id=%s;", (share, start.isoformat(), p["id"]))
+
+    # Apply payments in time order
+    payments = db_exec(
+        "SELECT id, person_id, amount, pay_date FROM payments ORDER BY pay_date ASC, id ASC;",
+        fetch="all",
+    )
+
+    for pay in payments:
+        pid = int(pay["person_id"])
+        amt = float(pay["amount"])
+        pay_date = pay["pay_date"]  # date object
+
+        person = db_exec("SELECT balance, last_calc FROM people WHERE id=%s;", (pid,), fetch="one")
+        bal = float(person["balance"])
+        last = person["last_calc"]
+
+        interest = accrue_interest_between(bal, d_rate, last, pay_date)
+        bal = bal + interest - amt
+
+        db_exec("UPDATE people SET balance=%s, last_calc=%s WHERE id=%s;", (bal, pay_date.isoformat(), pid))
+        db_exec("UPDATE payments SET interest=%s WHERE id=%s;", (interest, int(pay["id"])))
+
+    # Accrue everyone up to today for live balances
+    today = date.today()
+    for p in people:
+        person = db_exec("SELECT balance, last_calc FROM people WHERE id=%s;", (p["id"],), fetch="one")
+        bal = float(person["balance"])
+        last = person["last_calc"]
+        interest = accrue_interest_between(bal, d_rate, last, today)
+        db_exec("UPDATE people SET balance=%s, last_calc=%s WHERE id=%s;", (bal + interest, today.isoformat(), p["id"]))
+
+
+# Init DB at startup
 init_db()
 
 
@@ -149,7 +249,7 @@ def login():
     if request.method == "POST":
         u = request.form.get("username", "")
         p = request.form.get("password", "")
-        if u == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, p):
+        if u == ADMIN_USERNAME and hmac.compare_digest(p, ADMIN_PASSWORD):
             session["is_admin"] = True
             return redirect(url_for("index"))
         err = "Invalid username or password."
@@ -180,73 +280,6 @@ def logout():
     return redirect(url_for("login"))
 
 
-# ---------------- INTEREST + RECOMPUTE ----------------
-def daily_rate(db) -> float:
-    return float(get_setting(db, "interest_rate")) / 365.0
-
-
-def accrue_interest_between(balance: float, d_rate: float, from_date: date, to_date: date) -> float:
-    days = (to_date - from_date).days
-    if days <= 0:
-        return 0.0
-    return balance * d_rate * days
-
-
-def recompute_all(db):
-    """
-    Recompute:
-    - each payment's 'interest' field
-    - each person's balance and last_calc
-    This keeps everything correct when transactions are edited/deleted.
-    """
-    principal = float(get_setting(db, "principal"))
-    start = datetime.strptime(get_setting(db, "start_date"), "%Y-%m-%d").date()
-    d_rate = daily_rate(db)
-
-    people = db.execute("SELECT id FROM people ORDER BY id").fetchall()
-    if not people:
-        return
-
-    share = principal / float(len(people))
-
-    # Reset everyone to equal share at start date
-    for p in people:
-        db.execute(
-            "UPDATE people SET balance=?, last_calc=? WHERE id=?",
-            (share, start.isoformat(), p["id"]),
-        )
-
-    # Apply payments chronologically
-    payments = db.execute(
-        "SELECT id, person_id, amount, pay_date FROM payments ORDER BY pay_date ASC, id ASC"
-    ).fetchall()
-
-    for pay in payments:
-        pid = int(pay["person_id"])
-        amt = float(pay["amount"])
-        pay_date = datetime.strptime(pay["pay_date"], "%Y-%m-%d").date()
-
-        person = db.execute("SELECT balance, last_calc FROM people WHERE id=?", (pid,)).fetchone()
-        bal = float(person["balance"])
-        last = datetime.strptime(person["last_calc"], "%Y-%m-%d").date()
-
-        interest = accrue_interest_between(bal, d_rate, last, pay_date)
-        bal = bal + interest - amt
-
-        db.execute("UPDATE people SET balance=?, last_calc=? WHERE id=?", (bal, pay_date.isoformat(), pid))
-        db.execute("UPDATE payments SET interest=? WHERE id=?", (float(interest), int(pay["id"])))
-
-    # Accrue everyone to today for live balances
-    today = date.today()
-    for p in people:
-        person = db.execute("SELECT balance, last_calc FROM people WHERE id=?", (p["id"],)).fetchone()
-        bal = float(person["balance"])
-        last = datetime.strptime(person["last_calc"], "%Y-%m-%d").date()
-        interest = accrue_interest_between(bal, d_rate, last, today)
-        db.execute("UPDATE people SET balance=?, last_calc=? WHERE id=?", (bal + interest, today.isoformat(), p["id"]))
-
-
-
 # ---------------- UI ----------------
 BASE_CSS = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -268,24 +301,22 @@ BASE_CSS = """
 @app.route("/")
 @admin_required
 def index():
-    db = get_db()
-    recompute_all(db)
-    db.commit()
+    recompute_all()
 
-    people = db.execute("SELECT * FROM people ORDER BY id").fetchall()
-    principal = float(get_setting(db, "principal"))
-    rate = float(get_setting(db, "interest_rate"))
+    people = db_exec("SELECT * FROM people ORDER BY id;", fetch="all")
+    principal = float(get_setting("principal"))
+    rate = float(get_setting("interest_rate"))
+    start_date = get_setting("start_date")
     total = sum(float(p["balance"]) for p in people)
 
     rows = []
     for p in people:
-        interest_paid = db.execute(
-            "SELECT IFNULL(SUM(interest),0) FROM payments WHERE person_id=?",
+        interest_paid = db_exec(
+            "SELECT COALESCE(SUM(interest),0) AS s FROM payments WHERE person_id=%s;",
             (p["id"],),
-        ).fetchone()[0]
-        rows.append({**dict(p), "interest_paid": float(interest_paid)})
-
-    db.close()
+            fetch="one",
+        )["s"]
+        rows.append({**p, "interest_paid": float(interest_paid)})
 
     return render_template_string(
         BASE_CSS
@@ -295,6 +326,7 @@ def index():
         <div class="card">
           <div><b>Principal:</b> ${{'%.2f'|format(principal)}}</div>
           <div><b>Interest rate:</b> {{'%.3f'|format(rate*100)}}%</div>
+          <div><b>Loan start date (interest begins):</b> {{start_date}}</div>
           <div style="margin-top:8px"><b>Total remaining balance:</b> ${{'%.2f'|format(total)}}</div>
           <div style="margin-top:8px"><a href="/logout">Logout</a></div>
         </div>
@@ -344,6 +376,13 @@ def index():
               <button type="submit">Update rate</button>
             </form>
 
+            <form method="post" action="/set_start_date">
+              <label><b>Set loan start date</b> (interest begins)</label>
+              <input type="date" name="start_date" value="{{start_date}}" required>
+              <button type="submit">Update start date</button>
+              <div class="muted">Changing this recalculates all balances.</div>
+            </form>
+
             <form method="get" action="/monthly_pdfs">
               <label><b>Monthly PDFs</b> (your backup)</label>
               <input type="month" name="month" value="{{month}}">
@@ -355,19 +394,37 @@ def index():
         people=rows,
         principal=principal,
         rate=rate,
+        start_date=start_date,
         total=total,
         today=date.today().isoformat(),
         month=f"{date.today().year:04d}-{date.today().month:02d}",
     )
 
 
+# ---------------- Start date setting ----------------
+@app.route("/set_start_date", methods=["POST"])
+@admin_required
+def set_start_date():
+    new_start = request.form.get("start_date", "").strip()
+    try:
+        new_date = datetime.strptime(new_start, "%Y-%m-%d").date()
+    except Exception:
+        abort(400, "Invalid start date")
+
+    ep = earliest_payment_date()
+    if ep is not None and new_date > ep:
+        abort(400, f"Start date cannot be after earliest payment date ({ep}).")
+
+    set_setting("start_date", new_date.isoformat())
+    recompute_all()
+    return redirect(url_for("index"))
+
+
 # ---------------- People: rename ----------------
 @app.route("/people")
 @admin_required
 def people_list():
-    db = get_db()
-    people = db.execute("SELECT * FROM people ORDER BY id").fetchall()
-    db.close()
+    people = db_exec("SELECT * FROM people ORDER BY id;", fetch="all")
     return render_template_string(
         BASE_CSS
         + """
@@ -392,23 +449,17 @@ def people_list():
 @app.route("/people/<int:pid>/edit", methods=["GET", "POST"])
 @admin_required
 def people_edit(pid: int):
-    db = get_db()
-    person = db.execute("SELECT * FROM people WHERE id=?", (pid,)).fetchone()
+    person = db_exec("SELECT * FROM people WHERE id=%s;", (pid,), fetch="one")
     if not person:
-        db.close()
         abort(404)
 
     if request.method == "POST":
         new_name = request.form.get("name", "").strip()
         if not new_name:
-            db.close()
             abort(400, "Name required")
-        db.execute("UPDATE people SET name=? WHERE id=?", (new_name, pid))
-        db.commit()
-        db.close()
+        db_exec("UPDATE people SET name=%s WHERE id=%s;", (new_name, pid))
         return redirect(url_for("people_list"))
 
-    db.close()
     return render_template_string(
         BASE_CSS
         + """
@@ -438,48 +489,46 @@ def pay():
     if amount <= 0:
         abort(400, "Payment must be > 0")
 
-    db = get_db()
-    db.execute(
-        "INSERT INTO payments(person_id, amount, interest, pay_date, notes) VALUES(?,?,?,?,?)",
+    start = datetime.strptime(get_setting("start_date"), "%Y-%m-%d").date()
+    if pay_date < start:
+        abort(400, f"Payment date cannot be before loan start date ({start}).")
+
+    db_exec(
+        "INSERT INTO payments(person_id, amount, interest, pay_date, notes) VALUES(%s,%s,%s,%s,%s);",
         (person_id, amount, 0.0, pay_date.isoformat(), notes),
     )
-    recompute_all(db)
-    db.commit()
-    db.close()
+    recompute_all()
     return redirect(url_for("index"))
 
 
 @app.route("/payment/<int:pay_id>/edit", methods=["GET", "POST"])
 @admin_required
 def payment_edit(pay_id: int):
-    db = get_db()
-    pay = db.execute("SELECT * FROM payments WHERE id=?", (pay_id,)).fetchone()
+    pay = db_exec("SELECT * FROM payments WHERE id=%s;", (pay_id,), fetch="one")
     if not pay:
-        db.close()
         abort(404)
 
-    people = db.execute("SELECT id, name FROM people ORDER BY id").fetchall()
+    people = db_exec("SELECT id, name FROM people ORDER BY id;", fetch="all")
+    start = datetime.strptime(get_setting("start_date"), "%Y-%m-%d").date()
 
     if request.method == "POST":
         person_id = int(request.form["person_id"])
         amount = float(request.form["amount"])
-        pay_date = request.form["pay_date"]
+        pay_date = datetime.strptime(request.form["pay_date"], "%Y-%m-%d").date()
         notes = request.form.get("notes", "").strip()
 
         if amount <= 0:
-            db.close()
             abort(400, "Payment must be > 0")
+        if pay_date < start:
+            abort(400, f"Payment date cannot be before loan start date ({start}).")
 
-        db.execute(
-            "UPDATE payments SET person_id=?, amount=?, pay_date=?, notes=? WHERE id=?",
-            (person_id, amount, pay_date, notes, pay_id),
+        db_exec(
+            "UPDATE payments SET person_id=%s, amount=%s, pay_date=%s, notes=%s WHERE id=%s;",
+            (person_id, amount, pay_date.isoformat(), notes, pay_id),
         )
-        recompute_all(db)
-        db.commit()
-        db.close()
+        recompute_all()
         return redirect(url_for("person_statement", pid=person_id))
 
-    db.close()
     return render_template_string(
         BASE_CSS
         + """
@@ -506,6 +555,7 @@ def payment_edit(pay_id: int):
 
             <button type="submit">Save changes</button>
           </form>
+          <div class="muted">Loan start date is {{start}} (payments cannot be before this).</div>
         </div>
 
         <div class="card">
@@ -516,23 +566,20 @@ def payment_edit(pay_id: int):
         """,
         pay=pay,
         people=people,
+        start=start.isoformat(),
     )
 
 
 @app.route("/payment/<int:pay_id>/delete", methods=["POST"])
 @admin_required
 def payment_delete(pay_id: int):
-    db = get_db()
-    pay = db.execute("SELECT person_id FROM payments WHERE id=?", (pay_id,)).fetchone()
+    pay = db_exec("SELECT person_id FROM payments WHERE id=%s;", (pay_id,), fetch="one")
     if not pay:
-        db.close()
         abort(404)
 
     person_id = int(pay["person_id"])
-    db.execute("DELETE FROM payments WHERE id=?", (pay_id,))
-    recompute_all(db)
-    db.commit()
-    db.close()
+    db_exec("DELETE FROM payments WHERE id=%s;", (pay_id,))
+    recompute_all()
     return redirect(url_for("person_statement", pid=person_id))
 
 
@@ -540,26 +587,23 @@ def payment_delete(pay_id: int):
 @app.route("/person/<int:pid>")
 @admin_required
 def person_statement(pid: int):
-    db = get_db()
-    recompute_all(db)
-    db.commit()
+    recompute_all()
 
-    person = db.execute("SELECT * FROM people WHERE id=?", (pid,)).fetchone()
+    person = db_exec("SELECT * FROM people WHERE id=%s;", (pid,), fetch="one")
     if not person:
-        db.close()
         abort(404)
 
-    payments = db.execute(
-        "SELECT * FROM payments WHERE person_id=? ORDER BY pay_date DESC, id DESC",
+    payments = db_exec(
+        "SELECT * FROM payments WHERE person_id=%s ORDER BY pay_date DESC, id DESC;",
         (pid,),
-    ).fetchall()
+        fetch="all",
+    )
 
-    interest_paid_total = db.execute(
-        "SELECT IFNULL(SUM(interest),0) FROM payments WHERE person_id=?",
+    interest_paid_total = db_exec(
+        "SELECT COALESCE(SUM(interest),0) AS s FROM payments WHERE person_id=%s;",
         (pid,),
-    ).fetchone()[0]
-
-    db.close()
+        fetch="one",
+    )["s"]
 
     return render_template_string(
         BASE_CSS
@@ -615,10 +659,10 @@ def build_statement_pdf_bytes(person_name: str, balance: float, payments_rows) -
     for r in payments_rows:
         data.append(
             [
-                r["pay_date"],
+                str(r["pay_date"]),
                 f"${float(r['amount']):,.2f}",
                 f"${float(r['interest']):,.2f}",
-                (r["notes"] or "")[:60],
+                (r.get("notes") or "")[:60],
             ]
         )
 
@@ -630,20 +674,17 @@ def build_statement_pdf_bytes(person_name: str, balance: float, payments_rows) -
 @app.route("/person/<int:pid>/pdf")
 @admin_required
 def person_pdf(pid: int):
-    db = get_db()
-    recompute_all(db)
-    db.commit()
+    recompute_all()
 
-    person = db.execute("SELECT * FROM people WHERE id=?", (pid,)).fetchone()
+    person = db_exec("SELECT * FROM people WHERE id=%s;", (pid,), fetch="one")
     if not person:
-        db.close()
         abort(404)
 
-    payments = db.execute(
-        "SELECT pay_date, amount, interest, notes FROM payments WHERE person_id=? ORDER BY pay_date DESC, id DESC",
+    payments = db_exec(
+        "SELECT pay_date, amount, interest, notes FROM payments WHERE person_id=%s ORDER BY pay_date DESC, id DESC;",
         (pid,),
-    ).fetchall()
-    db.close()
+        fetch="all",
+    )
 
     pdf_bytes = build_statement_pdf_bytes(person["name"], float(person["balance"]), payments)
     filename = f"statement_{person['name'].replace(' ', '_')}.pdf"
@@ -654,7 +695,6 @@ def person_pdf(pid: int):
 @admin_required
 def monthly_pdfs_zip():
     month_str = request.args.get("month") or f"{date.today().year:04d}-{date.today().month:02d}"
-
     try:
         y, m = month_str.split("-")
         y = int(y)
@@ -665,28 +705,26 @@ def monthly_pdfs_zip():
 
     end = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
 
-    db = get_db()
-    recompute_all(db)
-    db.commit()
-
-    people = db.execute("SELECT * FROM people ORDER BY id").fetchall()
+    recompute_all()
+    people = db_exec("SELECT * FROM people ORDER BY id;", fetch="all")
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for person in people:
-            payments = db.execute(
-                """SELECT pay_date, amount, interest, notes
-                   FROM payments
-                   WHERE person_id=? AND pay_date >= ? AND pay_date < ?
-                   ORDER BY pay_date DESC, id DESC""",
+            payments = db_exec(
+                """
+                SELECT pay_date, amount, interest, notes
+                FROM payments
+                WHERE person_id=%s AND pay_date >= %s AND pay_date < %s
+                ORDER BY pay_date DESC, id DESC;
+                """,
                 (person["id"], start.isoformat(), end.isoformat()),
-            ).fetchall()
+                fetch="all",
+            )
 
             pdf_bytes = build_statement_pdf_bytes(person["name"], float(person["balance"]), payments)
             pdf_name = f"{person['name'].replace(' ', '_')}_Statement_{y:04d}_{m:02d}.pdf"
             zf.writestr(pdf_name, pdf_bytes)
-
-    db.close()
 
     zip_buf.seek(0)
     zip_name = f"Monthly_Statements_{y:04d}_{m:02d}.zip"
@@ -700,12 +738,8 @@ def set_principal():
     principal = float(request.form["principal"])
     if principal <= 0:
         abort(400, "Principal must be > 0")
-
-    db = get_db()
-    set_setting(db, "principal", str(principal))
-    recompute_all(db)
-    db.commit()
-    db.close()
+    set_setting("principal", str(principal))
+    recompute_all()
     return redirect(url_for("index"))
 
 
@@ -715,12 +749,8 @@ def set_rate():
     rate_pct = float(request.form["rate_pct"])
     if rate_pct <= 0:
         abort(400, "Rate must be > 0")
-
-    db = get_db()
-    set_setting(db, "interest_rate", str(rate_pct / 100.0))
-    recompute_all(db)
-    db.commit()
-    db.close()
+    set_setting("interest_rate", str(rate_pct / 100.0))
+    recompute_all()
     return redirect(url_for("index"))
 
 
